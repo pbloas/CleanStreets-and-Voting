@@ -1,0 +1,667 @@
+---
+title: "Final thesis data cleaning"
+author: "Pablo Aísa Serranos"
+execute:
+  message: false
+  warning: false
+format: 
+  html:
+    toc: true
+    toc-depth: 4
+    number-sections: true
+    self-contained: true
+    theme: journal
+editor: visual
+---
+
+## Introduction
+
+This notebook contains all the code and information related to the data cleaning and pre-processing for my Master's thesis: *The Politics of Clean Streets: Urban Maintenance and Voting in the City of Madrid*. The main idea of this document is to provide a data frame that groups all the variables necessary to carry out the subsequent analysis of the variables included. The rest of the information required to understand this work will be included in the official report delivered to the *Universidad Carlos III de Madrid* and also in this public repository on GitHub. The arguments that have led to the selection of each of the variables included in this clean-up can be found in the aforementioned report, but the main idea is to obtain statistical models that help to understand whether there is a relationship between urban clean-up and political disaffection.
+
+All variables included in this data cleaning and processing have been obtained from the open data website of the [Madrid City Council](https://datos.madrid.es/portal/site/egob) and the [National Statistics Institute](https://www.ine.es/dyngs/INEbase/listaoperaciones.htm) (INE).
+
+It should be noted that the main idea of this data pre-processing is to be able to work with census tracts in order to understand the effect of street cleaning levels on municipal elections in Madrid. As we are working with data from different years, we have chosen to carry out a crosswalk that synthesises in the same table the sections eliminated between 2019 and 2023 and those created in this same period.
+
+### Libraries and sf package
+
+These are the libraries that will be used for this part of the project:
+
+```{r}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+library(tidyverse)   # dplyr, ggplot2, readr, stringr …
+library(sf)          # spatial data (simple features)
+library(readxl)      # reading files
+library(janitor)     # clean_names()
+library(units)       # unit changes
+```
+
+Before starting with the data processing, I would like to comment that all this work could not have been done without the sf package and the explanations and examples on the official [Simple Features for R](https://r-spatial.github.io/sf/index.html) website. Thanks to this package, I have been able to understand different geographical issues that I had no idea about before starting the research and that were essential to ensure a correct development of this project.
+
+## Data cleaning and pre-processing
+
+The analysis begins by gathering the variables necessary to isolate the association of interest. As noted in the Introduction, the relevant information comes from multiple public sources. Therefore, all data sets must be aggregated at the census tract level, which is the unit of observation throughout the study. Furthermore, the scope of the project is limited to the twenty-one districts that make up the municipality of Madrid; no observations are kept outside this jurisdiction.
+
+### Sectioning limits
+
+The geographic framework employed is the official set of census sections released by the *Ayuntamiento de Madrid* in April 2023. The corresponding shapefile is publicly available at the municipal [geoportal](https://geoportal.madrid.es/IDEAM_WBGEOPORTAL/dataset.iam?id=e56f94d6-ffb1-11e9-8448-ecb1d753f6e8).
+
+To ensure correct comparability of different geographically referenced documents, the 2023 census tract layer must first be displayed using ETRS89 / UTM Zone 30 N (EPSG 25830) as the metric system. This is the official metric reference system used by Spanish national and municipal mapping agencies. Working in this CRS guarantees geometric compatibility with the rest of the City Council's open data layers and expresses all coordinates in meters.
+
+```{r}
+# date: 2023
+sections_raw <- st_read("data/Ambitos_electorales/Secciones_electorales.shp")
+
+# Official boundaries for Madrid: ETRS89/ UTM30N → EPSG:25830
+sections <- sections_raw |>
+  st_transform(25830) |> # both x and y coordinates are measured in metres
+  clean_names() |>
+  rename(cod_sec = codseccion) |>
+  select(cod_sec, geometry) |>
+  mutate(shape_area = st_area(geometry), # units: m^2
+         shape_area_km2 = set_units(shape_area, "km^2")) # units: km^2
+
+# Visual check
+plot(st_geometry(sections), 
+     main = "Census tracts Madrid (2023)", 
+     border = "grey80")
+```
+
+**Technical note:** The boundary layer is retained as an sf object rather than a base data.frame; preserving the sf class maintains the geometry metadata and simplifies all the spatial operations.
+
+### Municipal elections data
+
+Another large and essential part of this work is turnout and voting data to assess the relationship between street maintenance and political behaviour. The Madrid City Council provides the absolute results for the municipal elections of 2019 and 2023.
+
+Both results are divided by polling station and will therefore need to be grouped by census tract at a later stage. This step can only be done once the crosswalk has been done. However, both files have been cleaned a bit before to ensure that only the relevant data is presented.
+
+-   The results for 2019 are available [here](https://datos.madrid.es/portal/site/egob/menuitem.c05c1f754a33a9fbe4b2e4b284f1a5a0/?vgnextoid=4475a322a06f9410VgnVCM1000000b205a0aRCRD&vgnextchannel=374512b9ace9f310VgnVCM100000171f5a0aRCRD).
+-   And the results for 2023 can be found [here](https://www.madrid.es/portales/munimadrid/es/Inicio/El-Ayuntamiento/Estadistica/Areas-de-informacion-estadistica/Elecciones-y-participacion-ciudadana/Elecciones-/Resultados-electorales-Ayuntamiento-de-Madrid-2023/?vgnextfmt=default&vgnextoid=3b689a8f65ab9810VgnVCM2000001f4a900aRCRD&vgnextchannel=1a47c2338522a210VgnVCM1000000b205a0aRCRD).
+
+```{r}
+# 2019 results ─ polling-station level
+mun19 <- read_excel("data/munelections2019_absolutos.xlsx") |>
+  mutate(
+    district = str_pad(Distrito, 2, pad = "0"),
+    seccion  = str_pad(Sección, 3, pad = "0"),
+    cod_sec  = paste0(district, seccion)) |>
+  select(-Distrito, -Barrio, -Sección) |> 
+  clean_names()
+
+# 2023 results ─ polling-station level
+mun23 <- read_excel("data/munelections2023_absolutos.xlsx") |>
+  mutate(
+    district = str_pad(Distrito, 2, pad = "0"),
+    seccion  = str_pad(Sección, 3, pad = "0"),
+    cod_sec  = paste0(district, seccion)) |>
+  select(-Distrito, -Barrio, -Sección) |> 
+  clean_names()
+```
+
+Both files have been standardised to a five-digit identifier (*cod_sec*), obtained by concatenating a two-digit district code with a three-digit section code. This will ensure complete comparability with the other section-level indicators.
+
+To avoid potential problems with the disaggregation of data into polling stations, it is better to group the data directly by section. The results in absolute format mean that we can add them up without the need to calculate a weighted average between the number of polling stations in each census district.
+
+```{r}
+mun19_summary <- mun19 |> 
+  group_by(cod_sec) |> 
+  summarise(across(where(is.numeric), sum, na.rm = TRUE), .groups = "drop")
+
+mun23_summary <- mun23 |> 
+  group_by(cod_sec) |> 
+  summarise(across(where(is.numeric), sum, na.rm = TRUE), .groups = "drop")
+```
+
+With the election results grouped by census tract, it is now possible to proceed with the cross walk to obtain a joint distribution of both tracts.
+
+### Cross-walk 2019-2023
+
+Before merging the two electoral files, a concordance must be established between the 2019 and 2023 census sections. The City Council also has available a document where all the boundary adjustments made for census sections over the last decades are listed. This document shows (i) deleted sections that have been absorbed by a neighbouring section and (ii) newly created sections from an existing census section. Ideally, it would have been better to work with voters moved from one area to another with polling station data. However, it has not been possible to find information on these changes, so the most appropriate approach is to carry out a cross walk.
+
+-   All changes relating to census sectioning have been obtained [here](https://www.madrid.es/portales/munimadrid/es/Inicio/El-Ayuntamiento/Estadistica/Areas-de-informacion-estadistica/Territorio-climatologia-y-medio-ambiente/Territorio/Seccionado-censal/?vgnextfmt=default&vgnextoid=c13456bc06f59210VgnVCM2000000c205a0aRCRD&vgnextchannel=e59b40ebd232a210VgnVCM1000000b205a0aRCRD).
+
+The cross-table must assign to each deleted section the code of the constituency that now contains its territory and simultaneously ‘returns’ each newly created section to the code of its parent constituency as it was in 2019. The resulting look-up table thus produces a single set of unique identifiers: the total number of rows is slightly lower than the raw sum of sections in 2019 + 2023, but the territorial coverage remains complete. All subsequent datasets must be harmonised with this reference before merging.
+
+```{r, warning=FALSE}
+changes <- read_xls("data/cambios_sec.xls")
+
+# Extract the year
+changes$year_entry <- substr(changes$`Fecha de Alta`, 1, 4)
+changes$year_leave <- substr(changes$`Fecha de Baja`, 1, 4)
+
+# Relevant changes
+changes <- changes |> 
+  filter(year_entry >= 2019 & year_entry <= 2023 |
+         year_leave >= 2019 & year_leave <= 2023) 
+# All the changes were made in June of 2022
+
+# The census code should be shown with 5 numbers as it has been done before with the other tables.
+
+changes <- changes |> 
+  mutate(
+    # current code
+    cod_changed = paste0(
+      str_pad(Distrito, width = 2, pad = "0"),
+      str_pad(Sección, width = 3, pad = "0")),
+    # code changes
+    cod_proc = if_else(
+      !is.na(Procedencia),
+      paste0(str_pad(Distrito, width = 2, pad = "0"),
+             str_pad(Procedencia, width = 3, pad = "0")), NA),
+    cod_dest = if_else(
+      !is.na(Destino),
+      paste0(str_pad(Distrito, width = 2, pad = "0"),
+             str_pad(Destino, width = 3, pad = "0")), NA),
+    # change type to see what was done with the census tract
+    type = case_when(
+      is.na(Procedencia) ~ "removed",
+      is.na(Destino) ~ "created", 
+      TRUE ~ NA)) |> 
+  select(cod_changed, cod_proc, cod_dest, type) |>
+  # all the codes must be presented correctly
+  mutate( 
+    cod_proc = str_pad(as.character(cod_proc), 5, pad="0"),
+    cod_changed = str_pad(as.character(cod_changed), 5, pad="0"),
+    cod_dest = str_pad(as.character(cod_dest), 5, pad="0"))
+```
+
+These are all changes between 2019 and 2023, which is the relevant range of years for this project. For ease of analysis it is better to have only three columns (code in 2019, code in 2023 and type of change).
+
+```{r}
+crosswalk <- changes  |>  
+  mutate(cod_2019 = case_when(
+      type == "created" ~ cod_proc, # old divisions
+      type == "removed" ~ cod_changed,
+      TRUE ~  NA_character_), # make sure that the values are characters
+    cod_2023 = case_when(
+      type == "created" ~ cod_changed, # new divisions
+      type == "removed" ~ cod_dest, 
+      TRUE ~  NA_character_))  |>  
+  select(cod_2019, cod_2023, type)
+```
+
+The next step is to pass these changes to the municipal elections data. To do this, it is necessary to maintain the cross-walk analysis.
+
+```{r}
+removed_sec <- crosswalk |> 
+  filter(type == "removed") |>  # only old sections
+  select(cod_2019, cod_2023, type)
+
+# This information must be included into the 2019 elections df
+mun19_matched <- mun19_summary |> 
+  left_join(removed_sec, by = c("cod_sec" = "cod_2019")) |> 
+  mutate(
+    cod_sec = coalesce(cod_2023, cod_sec)) |>  # apply the changes if they exist
+  select(-cod_2023, -type)|> 
+  group_by(cod_sec) |> 
+  summarise(across(where(is.numeric), sum, na.rm = TRUE), .groups = "drop")
+
+# All the changes have been made correctly? 
+sec2019_matched <- mun19_matched |> 
+  select(cod_sec)
+
+# Census districts that are in mun2019 but not in mun2023
+matched_2019 <- sec2019_matched |> 
+  anti_join(mun23, by = c("cod_sec")) #0 observations
+```
+
+The same procedure must now applied to the sections created between 2019 and 2023. Unlike the eliminated tracts, these newly established sections represent partial splits: they consist of polling stations that were formerly embedded within an existing census section rather than an entire section being removed wholesale. However, it is impossible to know which voters were used to create the new sections. Consequently, the most practical solution is to check the 2019 electoral file and return the created census tracts to their old codes.
+
+```{r}
+# Correspondences old-new 
+created_sec <- crosswalk |> 
+  filter(type == "created") |>  # only new sections
+  select(cod_2019, cod_2023)
+
+mun23_matched <- mun23_summary |> 
+  left_join(created_sec, by = c("cod_sec" = "cod_2023")) |> 
+  # Old codes instead of new ones
+  mutate(cod_sec = coalesce(cod_2019, cod_sec)) |> 
+  select(-cod_2019)|> 
+  group_by(cod_sec) |> 
+  summarise(across(where(is.numeric), sum, na.rm = TRUE), .groups = "drop")
+```
+
+Ideally, it would have been more suitable to know how the new sections have been formed and to make these changes manually in the 2019 data. But, as mentioned above, it was finally decided to move forward with the cross walk structure by grouping the new sections with the old ones. It should be mentioned that, with this reasoning, it is assumed that there have been no changes at the polling station level between the two years. In other words, voters have not been transferred without creating new census districts.
+
+The correct process after doing this process would be to recalculate the percentages. However, since these are absolute results, there is not any problem. The census and the votes for each party will are grouped by census tract.
+
+#### Mun elections to census tracts
+
+With the data now fully aligned, vote counts can be converted to percentages to account for differences in population size across census sections. In this project, it is argued that political disengagement is analysed not only through the abstention rate but also through the change in support for each section’s leading party between the 2019 and 2023 municipal elections.
+
+```{r}
+# Political parties
+parties2019 <- names(mun19_matched)[9:27]
+parties2023 <- names(mun23_matched)[9:29]
+
+# Relative votes in percentages for all the political parties
+mun19_results <- mun19_matched |> 
+  mutate(valid_votes = censo - abstencion, # valid votes calculated manually
+         abstention_19 = (abstencion / censo) * 100,
+         (across(all_of(parties2019), ~ .x / valid_votes * 100, 
+                 .names = "pct_{.col}"))) |> 
+  select(cod_sec, abstention_19, starts_with("pct_")) # keep only relevant variables
+
+mun23_results <- mun23_matched |> 
+  mutate(valid_votes = censo - abstencion,
+         abstention_23 = (abstencion / censo) * 100,
+         (across(all_of(parties2023), ~ .x / valid_votes * 100, 
+                 .names = "pct_{.col}"))) |> 
+  select(cod_sec, abstention_23, starts_with("pct_"))
+```
+
+As it has been addressed, to understand how the cleaning levels can affect the political disaffection, it could be relevant to compare the votes for the most voted party in each census tract in 2019 and in 2023.
+
+```{r}
+# Most voted party and its %
+pct_party <- grep("^pct_", names(mun19_results), value = TRUE)
+
+# Most voted political party in each census tract
+mun19_results <- mun19_results |> 
+  rowwise() |> 
+  mutate(
+    result_19 = max(c_across(all_of(pct_party)), na.rm = TRUE), # results in %
+    party_19 = str_remove(pct_party[which.max(c_across(all_of(pct_party)))], "^pct_")
+  ) |> # name of the party
+  ungroup() |> 
+  select(cod_sec, abstention_19, result_19, party_19)
+```
+
+The election results can be merged into the main data frame, which contains the 2023 section boundaries. But, before undertaking this step, the census-section limits must be reviewed, as the 2023 boundary file do not perfectly align with the cross-walk codes derived from the 2019 framework.
+
+```{r}
+# Same process that has been done before with the 2023 data
+sections_matched <- sections |> 
+  left_join(created_sec, by = c("cod_sec" = "cod_2023")) |> 
+  mutate(cod_sec = coalesce(cod_2019, cod_sec)) |> 
+  select(-cod_2019)
+
+# It is necessary to join the shape areas
+sections_merged <- sections_matched |> 
+  group_by(cod_sec) |> 
+  summarise(geometry = sf::st_union(geometry), # st_union from sf to join geometries
+            shape_area = sum(shape_area, na.rm = FALSE), # area in m2
+            shape_area_km2 = sum(shape_area_km2, na.rm = FALSE) # area in km2
+            ) |> 
+  ungroup()
+```
+
+The electoral results can be now integrated into the census divisions data set.
+
+```{r}
+# 2023 results
+final_df <- sections_merged |> 
+  left_join(mun23_results, by = "cod_sec")
+
+# 2019 results
+final_df <- final_df |> 
+  left_join(mun19_results, by = "cod_sec")
+
+# Check for possible missing observations
+na_df <- final_df |>
+  st_drop_geometry()  |>
+  filter(is.na(result_19)) # 0 obs
+```
+
+## Feature selection
+
+The data framework currently contains numerous variables, many of which are not relevant for the present study, while a number of much-needed additional indicators are still missing. Therefore, this section consists of the following:
+
+-   Purge the dataset by retaining only the variables related to the research questions.
+-   Augment the electoral data by calculating, for each census tract, the percentage point change in support for the most voted party in the tract between 2019 and 2023.
+-   Add contextual indicators and socioeconomic variables.
+
+```{r}
+# Parties names updated to compare the winners
+final_df <- final_df |> 
+  mutate(
+    pct_mas_podemos = pct_mm_vq + pct_podemos_iu_av,
+    party_19 = case_when(
+      party_19 == "mas_madrid" ~ "mas_podemos",
+      party_19 == "p_p" ~ "pp",
+      party_19 == "p_s_o_e" ~ "psoe",
+      TRUE ~ party_19))
+
+# Long format to analyse the most voted parties
+long23 <- final_df |> 
+  st_drop_geometry() |>  # drop geometry for the joining
+  select(cod_sec, starts_with("pct_")) |> 
+  pivot_longer(
+    cols = starts_with("pct_"),
+    names_to = "party_col",
+    values_to = "result_23") |> 
+  mutate(party = str_remove(party_col, "^pct_")) |> 
+  select(-party_col)
+
+# left_join back onto the final df:
+df <- final_df |> 
+  left_join(long23, by = c("cod_sec", "party_19" = "party")) |> 
+  mutate(diff_vote = result_23 - result_19) |> # difference between the two results
+  select(cod_sec, diff_vote, abstention_23, shape_area_km2)
+```
+
+### Cleanliness levels
+
+The main independent variable—street-cleaning intensity—comes from the Madrid Geoportal layer released in December 2021. Each road segment is classified into one of four levels: Level 1 (highest service, daily sweeping and five mixed washings per week), Level 2 (three sweepings and three washings weekly), Level 3 (alternate-day sweeping, weekly washing), and Level 4 (weekly sweeping, monthly washing). These colour-coded segments should be spatially joined to census sections and converted into a length-weighted average that serves as the cleanliness indicator in all subsequent models.
+
+All these data is also available in the Madrid's open databank. In addition, the geoportal offers interactive maps to visualise the [street cleanliness levels](https://geoportal.madrid.es/IDEAM_WBGEOPORTAL/dataset.iam?id=1d8500e9-6879-11ec-b99b-60634c31c0aa).
+
+```{r}
+clean <- st_read("data/Limpieza_Espacios_Publicos/Niveles_de_limpieza_viaria.shp")
+cl <- plot(clean["geometry"])
+
+# Drop Z coordinates to keep only linestring format
+st_segmented <- st_cast(st_zm(clean, drop = TRUE), "MULTILINESTRING")
+```
+
+To improve interpretability the street-cleaning index was recoded so that larger values now denote more, not less, cleaning. The previous codification would have forced all subsequent coefficients to be read in the opposite direction of common intuition (a positive sign would imply dirtier streets). By reversing the scale before any aggregation the length-weighted average keeps exactly the same relative distances between sections, yet a higher score now means more frequent cleaning. The transformation is linear, preserves all variance, and allows the sign of model estimates to be interpreted directly.
+
+The street-segment layer must now be spatially aligned with the previously defined census sections. This is accomplished with *sf::st_intersection()*, which assigns every street segment to the census tracts whose polygon it intersects.
+
+```{r, warning=FALSE}
+# Intersect street segments with census tracts
+st_segments_int <- st_intersection(st_segmented, sections_merged) |> 
+  st_cast("LINESTRING") |> # geometry type back to lines
+  filter(NIVEL_LIMP %in% 1:4) |> # keep valid scores
+  mutate(
+    long_m = as.numeric(st_length(geometry)),
+    freq = 5L - as.integer(NIVEL_LIMP)) # reverse the scale, 4 becomes 1, 1 becomes 4
+
+# Length-weighted frequency per tract
+clean_index <- st_segments_int |> 
+  group_by(cod_sec) |> 
+  summarise(avg_clean = sum(freq * long_m) / sum(long_m),
+            .groups   = "drop") |> 
+  st_drop_geometry() # no geom needed
+
+# Merge into df
+df <- df |> 
+  left_join(clean_index, by = "cod_sec") |> 
+  relocate(avg_clean, .before = geometry)
+```
+
+Madrid's new cleaning contract came into force in November 2021 and, as stated on the city council's official [website](https://www.madrid.es/portales/munimadrid/es/Inicio/Medio-ambiente/Contrato-del-Servicio-de-Limpieza-de-Espacios-Publicos-en-Madrid/?vgnextfmt=default&vgnextoid=dfd17e2e864de710VgnVCM2000001f4a900aRCRD&vgnextchannel=3edd31d3b28fe410VgnVCM1000000b205a0aRCRD), it is divided into 6 lots which are distributed among the districts as follows:
+
+-   Lot 1: Centro, Chamberí and Tetuán districts.
+-   Lot 2: Arganzuela, Retiro, Salamanca and Chamartín.
+-   Lot 3: Fuencarral-El Pardo, Moncloa-Aravaca and Latina.
+-   Lot 4: Hortaleza, Barajas, Ciudad Lineal and San Blas-Canillejas.
+-   Lot 5: Puente de Vallecas, Moratalaz, Villa de Vallecas and Vicálvaro.
+-   Lot 6: Usera, Villaverde and Carabanchel.
+
+Since the *cod_sec* variable also presents the district code of the census tracts, these lots can be directly assigned to the data frame. This lot variable can be included as a set of fixed effects to absorb unobserved differences among contractors,
+
+```{r}
+zones <- st_read("data/Limpieza_Espacios_Publicos/Limpieza_Zonas_Desbroce.shp")
+# This is how they divide the cleaning in Madrid
+
+df <- df |> 
+  mutate(
+    district = as.integer(substr(sprintf("%05d", 
+                                         as.numeric(cod_sec)), 1, 2)),
+                                # Two first numbers as the district code
+    .before = cod_sec) |> 
+  # District to Lote
+  mutate(lote = case_when(
+    district %in% c( 1, 7, 6) ~ 1, # Centro, Chamberí, Tetuán
+    district %in% c( 2, 3, 4, 5) ~ 2, # Arganzuela, Retiro, Salamanca, Chamartín
+    district %in% c( 8, 9,10) ~ 3, # Fuencarral-El Pardo, Moncloa-Aravaca, Latina
+    district %in% c(16,21,15,20) ~ 4, # Hortaleza, Barajas, Ciudad Lineal, San Blas-Canillejas
+    district %in% c(13,14,18,19) ~ 5, # Pte de Vallecas, Moratalaz, Villa de Vallecas, Vicálvaro
+    district %in% c(12,17,11) ~ 6, # Usera, Villaverde, Carabanchel
+    TRUE ~ NA_integer_)) |> 
+  mutate(lote = factor(lote, levels = 1:6)) |>  # Lote as factor
+  relocate(lote, .before = avg_clean)
+```
+
+The next steps will be to add variables that can help to find the possible relationship between urban cleanliness and voting, as discussed above. The aim is to add all those factors that have been identified in previous literature as causing political abstention or political disaffection in general. In this way, socio-economic factors, contextual factors and data related to public services and urban activity will be added to complement the previously added factor of cleanliness.
+
+### Socio-economic context
+
+The main goal of this part is to add variables that capture the resident profile—age, educational attainment and origin—traditionally linked to individual–level political participation.
+
+#### Net income per capita
+
+All the data related to income levels in Spain can be consulted in the official INE [database](https://www.ine.es/jaxiT3/Tabla.htm?t=31097). Although the INE provides different variables to study the income distribution, in this case only the average net income per capita calculated by census section will be used. The latest available data is from 2022 so it fits perfectly with this project.
+
+```{r}
+income_raw <- read_csv2("data/income2022.csv", locale = locale(encoding = "Latin1"))
+
+income <- income_raw |> # data in long format 
+  pivot_wider(names_from  = `Indicadores de renta media y mediana`, # indicators
+              values_from = Total) |>
+  mutate(
+    cod_digits = str_remove_all(Secciones, "\\D"), # keep digits only
+    cod_sec = str_sub(cod_digits, -5) |> 
+      str_pad(5, pad = "0") # take the last 5 digits
+  ) |> 
+  select(cod_sec, net_income = `Renta neta media por persona`)
+
+income_matched <- income |>  
+  left_join(created_sec, by = c("cod_sec" = "cod_2023")) |> # use the cross-walk
+  mutate(cod_sec = coalesce(cod_2019, cod_sec)) |>  # replace if split section
+  group_by(cod_sec) |>  
+  summarise(net_income = mean(net_income, na.rm = TRUE), .groups = "drop")
+
+# Join with df
+df <- df |> 
+  left_join(income_matched, by = "cod_sec")
+```
+
+#### Total population
+
+The open data of Madrid City Council also has information related to the composition of census sections according to the place of origin of residents. In this case, only the total population for each section will be extracted, since the percentage of the population with Spanish nationality will be available later when obtaining the age variables.
+
+All information is available through this [link](https://datos.madrid.es/sites/v/index.jsp?vgnextoid=88ef31e2af4c1710VgnVCM2000001f4a900aRCRD&vgnextchannel=374512b9ace9f310VgnVCM100000171f5a0aRCRD). Data from previous years is also available, but for this part only statistics from May 2023 have been selected.
+
+```{r}
+stats <- read_csv2("data/estadisticas202305_ori.csv")
+
+stats <- stats |> 
+  mutate(
+    cod_sec = as.character(COD_DIST_SECCION), 
+    cod_sec = str_pad(cod_sec, width = 5, pad = "0")) |> # cod_sec to match the dfs
+  select(cod_sec, ESPANOLESHOMBRES, ESPANOLESMUJERES, 
+         EXTRANJEROSHOMBRES, EXTRANJEROSMUJERES) |> 
+  clean_names()
+
+# Household data that should be transformed into census tract level
+stats <- stats |> 
+  group_by(cod_sec) |> 
+  summarise(across(where(is.numeric), sum, na.rm = TRUE), .groups = "drop")
+
+# Created subdivisions back to the 2019 code
+stats_matched <- stats  |> 
+  left_join(created_sec, by = c("cod_sec" = "cod_2023"))  |> 
+  # Old codes instead of new ones
+  mutate(cod_sec = coalesce(cod_2019, cod_sec))  |> 
+  group_by(cod_sec)  |> 
+  summarise( across(
+    .cols  = where(is.numeric) & !any_of(c("cod_sec")),
+    .fns   = ~ sum(.x, na.rm = TRUE), # sum in this case
+    .names = "{.col}"), # original col name
+    total_pop = sum(c_across(where(is.numeric)), na.rm = TRUE),
+    # absolute values so it is not necessary to calculate the average
+    # total population will be useful for the population density
+    .groups = "drop") |> 
+  select(cod_sec, total_pop)
+
+df <- df |> 
+  left_join(stats_matched, by = "cod_sec")
+```
+
+#### Population density
+
+By calculating the total population and the area in km2 of each section, the number of inhabitants per km2 or, in other words, the population density per km2 can be easily calculated.
+
+```{r}
+# Directly calculated in the final df
+df <- df |> 
+  mutate(pop_density = total_pop/shape_area_km2) # population/area
+```
+
+### Demographic composition
+
+In order to fully understand how political disaffection and non-participation is distributed and develops, it is also necessary to include demographic variables that can indicate whether there are differences between different age groups or educational levels.
+
+#### Age variables and proportion of Spanish population
+
+The INE also provides a series of demographic indicators that are very important for understanding the age distribution in each section. In addition, it also includes the percentage of the Spanish population. The data can be consulted in the part of [demographic indicators at census section level](https://www.ine.es/jaxiT3/Tabla.htm?t=31105).
+
+```{r}
+age <- read_csv2("data/age_pop2022.csv", locale = locale(encoding = "Latin1"))
+
+age <- age |> # data from INE is always in long format
+  pivot_wider(names_from = `Indicadores demográficos`,
+              values_from = Total) |> 
+  mutate(cod_sec = as.character(Secciones))
+
+# Keep only the most relevant variables for further analysis
+age <- age |>  
+  mutate(cod_sec = sub(".*\\s", "", cod_sec)) |> 
+  select(cod_sec, `Edad media de la población`, 
+         `Porcentaje de población menor de 18 años`, 
+         `Porcentaje de población de 65 y más años`, 
+         Población, `Porcentaje de población española`) |> 
+  clean_names()
+
+age_matched <- age |> 
+  left_join(created_sec, by = c("cod_sec" = "cod_2023")) |> 
+  # Old codes instead of new ones
+  mutate(cod_sec = coalesce(cod_2019, cod_sec)) |> # Only one age measure per tract
+  group_by(cod_sec) |> 
+  summarise(
+# it is necessary to calculate the mean since the data has been grouped by cod_sec
+    avg_age = mean(edad_media_de_la_poblacion, na.rm = TRUE),
+    under18 = mean(porcentaje_de_poblacion_menor_de_18_anos, na.rm = TRUE),
+    above65 = mean(porcentaje_de_poblacion_de_65_y_mas_anos, na.rm = TRUE),
+    pop_esp = mean(porcentaje_de_poblacion_espanola, na.rm = TRUE),
+    .groups = "drop") |> 
+  select(cod_sec, avg_age, under18, above65, pop_esp) |> 
+  distinct()
+
+df <- df |> 
+  left_join(age_matched, by = "cod_sec")
+```
+
+With this section, it has been incorporated four essential census-based indicators that summarise the age structure and nativity of each section’s resident population:
+
+-   Mean age (avg_age)
+-   Share under 18 yrs (under18)
+-   Share 65 yrs and over (above65)
+-   Share of Spanish nationals (pop_esp)
+
+#### Education levels
+
+Educational level is widely recognized as one of the main determinants of political participation and, by extension, of political disengagement. Therefore, it should be incorporated into the analysis. The data comes from the Madrid City Council, which reports the population of each census section broken down by sex and educational level. All the data is from January 2023 and can be obtained [here](https://geoportal.madrid.es/IDEAM_WBGEOPORTAL/dataset.iam?id=b118598c-23f3-11eb-b20f-98e7f4edb47e).
+
+The table also includes the total population of both sexes and divides the levels of education as follows:
+
+1.  People who cannot read or write
+2.  People with no formal education
+3.  People with incomplete primary education
+4.  People with elementary secondary education, lower secondary certificate, or ESO
+5.  People with first-level vocational training
+6.  People with second-level vocational training
+7.  People with upper secondary education or BUP
+8.  Holders of intermediate-level qualifications
+9.  Graduates of university diploma programmes
+10. Technical architects or technical engineers
+11. University degree holders
+12. Holders of non-university higher qualifications
+13. Doctorates and postgraduate degrees
+14. Unknown / not recorded
+
+In order to simplify the analysis, only the data for both sexes is selected. On the other hand, it will be easier for the analysis to group them in different levels.
+
+```{r}
+edu <- st_read("data/20230101_estudios/20230101_estudios_seccion.shp")
+
+edu <- edu |> 
+  mutate(
+    # Variables grouping different levels of education
+    low_edu = (ambos_se_1 + ambos_se_2 + ambos_se_3 + ambos_s_14) / 
+      ambos_sexo * 100,
+    med_edu = (ambos_se_4 + ambos_se_5 + ambos_se_6 + ambos_se_7 + ambos_se_8) /
+      ambos_sexo * 100,
+    high_edu = (ambos_se_9 + ambos_s_10 + ambos_s_11 + ambos_s_12 + ambos_s_13) /
+      ambos_sexo * 100) |> 
+  select(cod_sec = COD_SEC, high_edu)
+
+edu_matched <- edu  |>
+  left_join(created_sec, by = c("cod_sec" = "cod_2023"))  |> 
+  # Old codes instead of new ones
+  mutate(cod_sec = coalesce(cod_2019, cod_sec))  |> 
+  # Only one education level per tract
+  group_by(cod_sec)  |> 
+  summarise(
+    high_edu = mean(high_edu, na.rm = TRUE),
+    .groups = "drop")  |> 
+  select(cod_sec, high_edu)  |> 
+  st_drop_geometry()
+
+df <- df |> 
+  left_join(edu_matched, by = "cod_sec")
+```
+
+Only the high-education share is retained, both to eliminate the exact linear dependence that would arise from including all education categories and to preserve a concise indicator of the educational gradient.
+
+### Urban services and activity
+
+The last part of this paper attempts to add novel variables that can serve as proxies to on the one hand complement the cleanup data and, on the other hand, try to capture the business and local activity that may exist in specific areas. This urban activity may be one of the reasons that define the distribution of street cleaning levels. More activity also requires more cleaning and could affect the research results and interpretation.
+
+In this way, the geolocation of garbage containers and street lamps will be added to obtain the total number of them in each section and their density per km2.
+
+#### Trash bins
+
+The container data collects the geolocation for all types of waste collected in the city of Madrid. Therefore, the information that appears is for paper, glass, packaging, waste and organic containers. However, there is a problem and it is that, being a csv file, it does not present the necessary coordinate data to represent maps in R and therefore georeference them. This makes it necessary to transform the file to sf format from the x and y coordinate variables that are included in the document.
+
+```{r}
+cont <- read_csv2("data/Contenedores_varios.csv") # csv not presented in sf format
+
+# Sf format
+cont_sf <- cont |> 
+  transmute(
+    tipo = `Tipo Contenedor`,
+    modelo = Modelo,
+    x = `Coordenada X`, # coordinates x and y
+    y = `Coordenada Y`) |> 
+  st_as_sf(coords = c("x", "y"), crs = 25830) # coords in metres
+
+# Join with the final df
+df <- df |> 
+  mutate(
+    n_bin = lengths(st_intersects(df, cont_sf)), # simple count
+    bin_density = n_bin/shape_area_km2 ) # per km²
+```
+
+It seems that everything has been calculated correctly although there are sections with no containers. The two variables that are added in these steps will help to control for economic and social activity, although some areas in the centre of Madrid may not have a large number of litter bins on their streets due to their narrow width.
+
+#### Streetlights
+
+The street lights are georeferenced as they are a shp file, which simplifies the data processing. However, it will be necessary to ensure that the coordinates are expressed in the official metric reference system previously defined (EPSG 25830).
+
+```{r}
+lights <- st_read("data/20220408_DATOS_ABIERTOS_UNIDAD_LUMINOSA_/20220408_DATOS_ABIERTOS_UNIDAD_LUMINOSA_.shp") |> 
+  st_transform(25830)
+
+# Link directly with the final df
+df <- df |> 
+  mutate(
+    n_light = lengths(st_intersects(df, lights)), # number of street lights
+    light_density = n_light/shape_area_km2) # per km²
+```
+
+Finding a way to measure activity in certain areas relative to others is not easy. In the end it has been decided to use the number of streetlights as a proxy, but with more time and in more detail, data on open premises or even daily foot traffic could also be included as useful proxies.
+
+On the other hand, trash bins and streetlight density were calculated as the number of elements per km2 of each census tract. Although this approach can lead to inflated values in small tracts, it will be possible to use logarithmic transformations (*log(1+x)*) in further steps to mitigate the effect of extreme ratios caused by very small areas. Therefore, the area-based density measure is retained for simplicity and comparability across sections, without substantially affecting the direction or significance of the coefficients.
+
+## Spatial copy in a GeoPackage
+
+Before finishing this document, it is necessary to save the data correctly in order to use it directly in the analysis phase without the need to load all this code. For this purpose, the *write_sf* function can be used to save the geo references and coordinates as a *GeoPackage*.
+
+```{r}
+# GeoPackage to maintain the geo references
+write_sf(df, "data/clean_sections.gpkg", overwrite = TRUE)
+```

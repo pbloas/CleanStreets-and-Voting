@@ -1,0 +1,573 @@
+---
+title: "Final thesis data analysis"
+author: "Pablo Aísa Serranos"
+execute:
+  message: false
+  warning: false
+format: 
+  html:
+    toc: true
+    toc-depth: 4
+    number-sections: true
+    self-contained: true
+    out-width: 100%
+    theme: journal
+editor: visual
+---
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(fig.width  = 7, fig.height = 4.5, dev = "cairo_pdf")
+```
+
+## Introduction
+
+This notebook contains explains the modelling scheme used for my Master's thesis: *The politics of clean streets: urban maintenance and voting in the City of Madrid*. All raw sources and election data, have been previously merged into a single census-section file. From that unified dataset, variables will be transformed (logs for highly skewed counts, proportions rescaled to 0–1) and population weights will also be added. Two outcomes are then modelled step by step:
+
+-   Abstention 2023 that will be estimated by using beta regression (0–1 fractional response).
+-   Change in leading-party vote (2019-2023). Estimated with linear regression.
+
+This four-block structure will be followed for the analysis:
+
+-   Model 1 includes only basic demographic data: age, proportion of Spaniards and population density. This first model captures standard demographic turnout gaps and givxe a benchmark of participation differences.
+-   Model 2 adds income and simple indicators of economic activity, asking whether more affluent or busier areas vote differently. Moreover, it also introduces general municipal services such as street lighting to see whether the mere presence of municipal services affects turnout.
+-   Model 3 introduces the street cleanliness index; if cleanliness continues to show an effect in this case, it suggests a real link between cleaner streets and lower political disaffection.
+-   Model 4 (interaction model) keeps every variable from Model 3 and includes interaction terms. If the interaction terms are significant, they reveal that the impact of street cleaning is stronger (or weaker) in specific areas of Madrid. This final step tests whether the *clean-streets* effect is uniform across the city or depends on the broader context.
+
+After the four nested models are fitted, Moran’s I is applied to the residuals. Where significant spatial autocorrelation remains, the best-performing specification will be re-estimated with a spatial-lag model (*lagsarlm*) to account for neighbourhood spill-overs. Model comparisons rely on AIC/log-likelihood within each family and pseudo-R² for beta regressions. For the case of the percentage vote difference, the idea is to go straight to the more complex model and adapt it to these spatial singularities.
+
+Full technical details are provided in the written report; this file provides code transparency, model-ready data framework and indicates why each block of variables is added.
+
+### Libraries
+
+These are all the variables that will be used for the statistical analysis.
+
+```{r, warning=FALSE, message=FALSE}
+library(sf)
+library(tidyverse)
+library(patchwork) # multiple ggplot objects into a single figure
+library(paletteer) # wide range of colour palettes
+library(showtext) # load and embed Google fonts
+library(betareg) # beta-regression for proportional outcomes
+library(DataExplorer) # quick exploratory plots
+library(knitr) # knit R Quarto chunks and create nicely formatted tables
+library(stargazer) # export summaries to LaTeX
+library(xtable) # convert to LaTeX tables
+library(spdep) # Moran’s I diagnostics
+library(spatialreg) # estimate spatial lag regressions
+library(broom) # tidiers for many model classes
+```
+
+## Descriptive analysis
+
+Before starting with the models, it is best to carry out a small descriptive analysis that helps to understand how the variables included in the data frame are distributed and how they are related to each other.
+
+Before starting with the descriptive analysis, it is a good idea to see how the census tracts have been finally divided after the above-mentioned crosswalk throughout the data preprocessing. The final data frame presents 2416 observations, keeping the sections eliminated in 2022 but returning the sections created in the same year to their original ones.
+
+```{r}
+# File previously saved
+data <- read_sf("data/clean_sections.gpkg")
+
+map <- ggplot(data) +
+  geom_sf(fill = NA, colour = "grey30", linewidth = 0.01) +
+  theme_minimal() +
+  theme(
+    axis.text  = element_blank(),
+    panel.grid = element_blank())
+map
+
+# Save the map
+ggsave(filename = "figures/sections_map.pdf", plot = map,
+       width = 7, height = 5, units = "in", device = cairo_pdf)
+```
+
+As can be seen on the map, the sections are much smaller closer to the centre. A higher population density requires less area to create a census district, since the main idea is to maintain a similar number of people in almost all of them. For this reason, the outer sections are much larger, mainly those adjacent to *Casa de Campo*, *Monte del Pardo* and *Ensanche de Vallecas*.
+
+### Exploring and transforming the numerical variables
+
+The descriptive section begins by inspecting the structure of the working data set and ensuring that each field has the correct type.
+
+```{r}
+# Check variables format
+str(data)
+data$district <- as.factor(data$district) # district should be a factor
+```
+
+*str(data)* confirms that all quantitative variables are stored as numeric, while the district identifier should be converted to a factor so that it will later enter the regression as a set of fixed effects rather than as a linear term.
+
+With the data types settled, it is now possible to produce a compact statistical portrait of every numerical covariate. First, the geometry column should be dropped since the polygons are irrelevant for this case. Only numeric variables should be retained. Then, thanks to the stargaze package, it is possible to create a LaTeX table that lists the mean, median, standard deviation, minimum, and maximum of every numerical variable that will later enter the models.
+
+```{r}
+# Select only numeric variables
+data_num <- data |> 
+  dplyr::select(where(is.numeric)) |> 
+  st_drop_geometry() |> 
+  as.data.frame()
+
+# Well written names for the table
+tab_names <- c(
+  "Vote Difference",
+  "Abstention Rate (2023)",
+  "Area (km²)",
+  "Cleanliness",
+  "Net Income",
+  "Population",
+  "Population Density",
+  "Average Age",
+  "Under 18 (%)",
+  "Over 65 (%)",
+  "Spanish Nationals (%)",
+  "Higher Education (%)",
+  "Number of Bins",
+  "Bin Density",
+  "Number of Streetlights",
+  "Streetlight Density")
+
+# Statistics summary for numeric variables
+names(data_num) <- tab_names
+
+stargazer(data_num, type = "latex",
+          summary.stat = c("mean", "median", "sd", "min", "max"),
+          font.size = "scriptsize", float = FALSE, title = "", digits = 2, 
+          out = "tables/summary_table.tex")
+```
+
+Based on these data, it appears that density and area-related variables may cause some problems. As previously mentioned, there are several very large sections that have low population density but also lower density of streetlights and litter bins.
+
+To analyse the distribution of the numerical variables that will be included in the modelling part of the project, the *plot_histogram* function of the *DataExplorer* package could show relevant results in a quick and easy way.
+
+```{r}
+plot_histogram(data, ggtheme = theme_classic())
+```
+
+The histograms reveal strong right-skewness for most count and density variables. Before fitting any model, these variables should be re-scaled to make their distributions more symmetric and to reduce the leverage of extreme observations; the transformed series are the ones that will enter the regression models.
+
+By contrast, the street-cleaning index (*avg_clean*) is left in its original metric—because it is already bounded and interpretable. However, it is possible that non-linearity will be handled later for the modelling stage by adding a squared term (*avg_clean²*).
+
+```{r}
+# Variables transformation
+data <- data |> 
+  mutate(
+    # skewed distributions
+    log_bin_density    = log1p(bin_density), # log(1+x) handles zeros
+    log_light_density  = log1p(light_density),
+    # The rest of these variables are > 0 in every tract
+    log_pop_density    = log(pop_density),
+    log_total_pop      = log(total_pop),
+    log_area_km2       = log(shape_area_km2),
+    log_net_income     = log(net_income),
+    # proportions (0–1) instead of percentages
+    abst_prop = abstention_23 / 100,
+    high_edu_prop = high_edu / 100,
+    pop_esp_prop = pop_esp / 100,
+    under18_prop = under18 / 100,
+    above65_prop = above65 / 100)
+```
+
+With this set of variables a correlation matrix can now be constructed showing the transformed variables and thus checking their pairwise relationships to diagnose possible multicollinearity before defining the models. Given that there are a multitude of variables for linear correlation analysis, only those variables that may be most relevant for the study will be selected, as their importance has been previously demonstrated in previous research on political disaffection and voter turnout.
+
+```{r}
+# Only num variables previously transformed
+names_corr <- c(
+  "Abstention (prop.)" = "abst_prop",
+  "Δ Leading-party vote" = "diff_vote",
+  "Cleaning index" = "avg_clean",
+  "High education (prop.)" = "high_edu_prop",
+  "log(Net income)" = "log_net_income",
+  "log(Pop. density)" = "log_pop_density",
+  "log(Bins per km²)" = "log_bin_density",
+  "log(Lights per km²)" = "log_light_density",
+  "Average age" = "avg_age")
+
+vars_corr <- unname(names_corr)
+
+corr_vars <- data |>
+  st_drop_geometry() |>
+  dplyr::select(all_of(vars_corr)) |>
+  dplyr::rename(!!!names_corr)    
+
+# Corr matrix and p-values
+M <- round(cor(corr_vars, use = "pairwise.complete.obs"), 2)
+
+# Convert to data frame
+corr_df <- as.data.frame(M) |> 
+  tibble::rownames_to_column("Variable")
+colnames(corr_df)[-1] <- seq_len(ncol(corr_df) - 1) # cols with numbers
+
+# Export to Latex
+stargazer(corr_df, type = "latex", float = FALSE, rownames = FALSE, 
+          font.size = "scriptsize", summary = FALSE,
+          out = "tables/correlation_table.tex")
+```
+
+### Descriptive graphics
+
+Once the variables to be included in the analytical part have been defined and transformed, it is advisable to make some descriptive graphs that help to better understand how the most important variables are distributed and related to each other. For this purpose, different visual representations could be made, maintaining a similar aesthetic that can be easily exported to the official report submitted as the final thesis.
+
+```{r}
+# Download and install the font wanted for the plots
+font_add_google("Roboto Condensed", family = "roboto_cond")
+
+# Activate showtext for all the visual representations
+showtext_auto(enable = TRUE)
+```
+
+#### Maps
+
+As has already been mentioned on several occasions, to understand the effect of the distribution of cleaning on political disaffection, it has been decided to use two dependent variables: abstention in the municipal elections of 2023 and the difference in percentage points of the vote for the most voted party in each section in 2019 compared to its result in 2023. Given the spatial importance of this work, the best option is to represent two maps with each of the two variables in which electoral dynamics can be seen in some specific areas.
+
+```{r}
+## a-Abstention 2023 (%)
+map_abst <- ggplot(data) +
+  geom_sf(aes(fill = abstention_23),
+          colour = "white", linewidth = NA) +
+  scale_fill_gradientn(
+    colours  = c("#B4D4DA", "#3885B6", "#26456E"),
+    limits   = c(0, 100),
+    breaks   = seq(0, 100, 25),
+    name     = "Abstention 2023 (%)",
+    na.value = "grey85",
+    guide    = guide_colourbar(barheight = unit(60, "pt"))
+  ) +
+  theme_void(base_family = "roboto_cond") +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.title = element_text(size = 10),
+    legend.position = "right") +
+  labs(title = "Abstention rate 2023")
+
+## b-Δ vote share of leading party (2019-2023)
+map_diff <- ggplot(data) +
+  geom_sf(aes(fill = diff_vote),
+          colour = "white", linewidth = NA) +
+  scale_fill_gradientn(
+    colours  = c("#b2182b", "#ef8a62", "#f7f7f7", "#6DB463", "#24693D"),
+    limits   = c(-50, 50),
+    breaks   = seq(-50, 50, 25),
+    name     = "Δ Leading-party share (p.p.)",
+    na.value = "grey85",
+    guide    = guide_colourbar(barheight = unit(60, "pt"))
+  ) +
+  theme_void(base_family = "roboto_cond") +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.title = element_text(size = 10),
+    legend.position = "right") +
+  labs(title = "Vote-share change 2019–2023")
+
+## Combine both maps
+map2 <- (map_abst | map_diff) +
+  theme(plot.margin = margin(0, 0, 0, 0))
+map2
+
+ggsave(filename = "figures/map_vote.pdf", plot = map2,
+       width = 18, height = 9, units = "cm", device = cairo_pdf)
+```
+
+The large number of sections in the centre makes it difficult to see relevant results in this area. However, certain dynamics are visible in the peripheral areas of both maps. It should be noted that the *Partido Popular (PP)* greatly improved its results in 2023 compared to 2019. This change could explain the large difference between the northwest and northeast for the vote difference variable. Probably the areas marked in red voted more for *Más Madrid* in 2019, while the more greenish areas had already voted heavily for the PP in 2019 but simply increased their support for this party even more in 2023.
+
+The other major part of this work has to do with trying to explain political disaffection from the point of view of urban maintenance and street cleaning. In order to properly understand how these factors can affect voting dynamics, it has been included the levels of frequency of municipal cleaning in each street but aggregated by census tract. In addition, it has also been included the separation of cleaning contracts according to the districts for which each lot is responsible. It is possible to check whether there is a certain relationship between these two variables by comparing their geographical distributions in maps.
+
+```{r}
+## a–Average cleaning index
+map_clean <- ggplot(data) +
+  geom_sf(aes(fill = avg_clean), colour = "white", linewidth = NA) +
+  scale_fill_gradientn(colours = c("#f2f0f7", "#cbc9e2", "#9e9ac8", "#6a51a3"),
+    limits = c(1, 4),
+    name = "Avg. cleaning\nindex",
+    guide = guide_colourbar(barheight = unit(60, "pt"))) +
+  theme_void(base_family = "roboto_cond") +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.title = element_text(size = 10),
+    legend.position = "right") +
+  labs(title = "Weighted cleaning levels")
+
+## b–Cleaning contract lot
+map_lot <- ggplot(data) +
+  geom_sf(aes(fill = factor(lote)), colour = "white", linewidth = NA) +
+  scale_fill_manual(
+    values = c("1" = "#7fc97f", "2" = "#beaed4", "3" = "#00A1D5",
+               "4" = "#374E55", "5" = "#79AF97", "6" = "#EE4C97"),
+    name = "Cleaning lot",
+    guide = guide_legend(override.aes = list(colour = NA, linewidth = 0.1))) +
+  theme_void(base_family = "roboto_cond") +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.title = element_text(size = 10),
+    legend.key.size = unit(4, "mm"),
+    legend.position = "right") +
+  labs(title = "Municipal cleaning lots (1–6)")
+
+## Combine both maps
+map3 <- (map_clean | map_lot) +
+  theme(plot.margin = margin(0, 0, 0, 0))
+map3
+
+ggsave(filename = "figures/map_clean_lot.pdf", plot = map3,
+       width = 18, height = 9, units = "cm", device = cairo_pdf)
+```
+
+The distribution of cleaning lots is related to geographical areas of the city of Madrid as each lot is assigned to districts in close proximity to each other. However, this may also mean that the distribution of lots is also related to other socio-demographic or even electoral variables.
+
+#### More descriptive analysis
+
+In this section, it is possible to continue the analysis by adding new variables to observe new dynamics. Continuing with the municipal cleaning lots, it is a great idea to create a table of grouped averages for each lot to show how this distribution affects to the most relevant variables included in this project.
+
+```{r}
+# Summary grouped by lot
+lot_summary <- data |> 
+  st_drop_geometry() |> 
+  group_by(lote) |> 
+  summarise( # variables that should be included
+    "Abstention (%)" = mean(abstention_23, na.rm = TRUE),
+    "Vote difference" = mean(diff_vote, na.rm = TRUE),
+    "Cleaning index" = mean(avg_clean, na.rm = TRUE),
+    "Net Income" = mean(net_income, na.rm = TRUE),
+    "Pop. density" = mean(pop_density, na.rm = TRUE),
+    .groups = "drop")|> 
+  mutate(across(where(is.numeric), ~sprintf("%.2f", .x))) |>
+  rename("Cleaning lot" = lote)
+
+# Save it to latex
+stargazer(lot_summary, type = "latex", float = FALSE, rownames = FALSE, 
+          font.size = "scriptsize", summary = FALSE, 
+          out = "tables/lot_summary.tex")
+```
+
+The aim of this document is to provide the code correctly explained and ordered, without going into a very developed analysis of the results that can be shown with the outputs. However, it can be clearly seen that there are certain differences between the cleaning batches. When dealing with districts that are close to each other, they also take areas with similar income levels and that vote similarly.
+
+Many authors highlight the relationship between income and voter turnout. In this case, this social phenomenon can be represented with a scatter plot showing the relationship between abstention rate in 2023 and net income per capita in each census tract.
+
+```{r}
+g1 <- ggplot(data, aes(x = net_income, y = abstention_23)) +
+  geom_point(alpha = 0.35, colour = "grey20") +
+  geom_smooth(method = "lm", se = FALSE, colour = "#007ED3", linewidth = 0.9) +
+  scale_x_continuous(labels = scales::comma_format(suffix = "€")) +
+  labs(x = "Average net income (€)",
+       y = "Abstention 2023 (%)") +
+  theme_minimal(base_family = "roboto_cond") +
+  theme(axis.title = element_text(face = "bold"))
+
+# Save the plot
+ggsave(filename = "figures/income_abstention.pdf", plot = g1,
+       width = 14, height = 9, units = "cm", device = cairo_pdf)
+```
+
+Firstly, it should be noted that the values grouped at the end of the graph are not a coding error of the variable, but rather that the INE indicates the same maximum income level for several sections of Madrid. On the other hand, the graph clearly shows the relationship between voter turnout and income: census districts with more resources have lower abstention rates.
+
+These possible relationships between dependent variables will be properly understood once all the design and results of the regression models have been carried out.
+
+## Modelling sequence
+
+This section presents the step-wise estimation strategy used to identify whether street-cleaning intensity is associated with political disengagement once demographic, socio-economic, and service-provision factors are taken into account. Two dependent variables will be analysed in parallel: - the abstention rate recorded in the 2023 municipal election and - the change in vote share obtained by the leading party between 2019 and 2023.
+
+For each outcome, four nested specifications are estimated so that the contribution of successive blocks of covariates can be assessed with likelihood criteria (AIC) and changes in explanatory power.
+
+### Abstention rate
+
+Abstention is going to be modeled using beta regression because the dependent variable has been transformed into proportion bounded between 0 and 1 (it would have been the same with percentage). Traditional linear regression is not well-suited for this type of outcome, it may predict values outside the valid range and assumes constant variance across observations. In contrast, beta regression is designed for proportion data, accounting for its specific distributional characteristics and ensuring valid, interpretable predictions. This type of regression model is included in R within the [betareg package](https://topmodels.r-forge.r-project.org/betareg/vignettes/betareg.html#sec-illustrations). There is a lot of information available on how to use *betareg* functions and how to interpret their outputs, so it is easy to get a basic idea of what is involved in working with this type of model.
+
+Furthermore, several independent variables have been log-transformed to reduce the effect of outliers and address their highly skewed distributions. This transformation makes relationships more linear and stabilizes variance, improving model performance. Hence, these are the variables that will be included in the models. On the other hand, all models are weighted by the total population of each census tract. This ensures that more populated areas have a proportionally greater influence in the estimation process, avoiding overrepresentation of smaller or sparsely populated sections. These two key points will also be maintained for the other outcome variable.
+
+#### Demographic baseline
+
+The first specification isolates purely demographic effects. It regresses the proportion of abstainers in each census section on the average age of residents, the proportion of Spanish nationals, the (log-transformed) population density, and a full set of district fixed effects to capture unobserved sub-municipal heterogeneity.
+
+By establishing this benchmark, subsequent models can show how much of the spatial variation in turnout is additionally explained by economic resources, municipal services, and street-cleaning intensity.
+
+```{r}
+## Model 1 ─ Demographic baseline
+mod1 <- betareg(abst_prop ~ avg_age + pop_esp_prop + log_pop_density +
+                  factor(district), data = data, weights = total_pop)
+summary(mod1)
+```
+
+#### Socio-economic context and basic services
+
+The second model adds a set of variables that aim to reflect the broader socio-economic context and the presence of general municipal services. In addition to the demographic factors included previously, this model introduces average income, the proportion of residents with higher education, and indicators of basic public infrastructure such as the density of waste bins and streetlights. These additions allow to assess whether higher levels of affluence or service provision are associated with changes in abstention levels, beyond basic demographic characteristics.
+
+```{r}
+## Model 2 ─ + socio-economic context & basic services
+mod2 <- betareg(abst_prop ~ avg_age + pop_esp_prop + log_pop_density + 
+                  log_net_income + high_edu_prop + log_bin_density +
+                  log_light_density + factor(district), 
+                data = data, weights = total_pop)
+summary(mod2)
+```
+
+#### Cleaning frequency
+
+The third model incorporates the key independent variable of interest: street cleanliness. A squared term is also included to allow for potential non-linear effects—such as the possibility that the relationship between cleanliness and political disengagement is stronger in very clean or very dirty areas. This model tests whether street maintenance practices, as experienced by residents, are associated with differences in electoral participation.
+
+```{r}
+## Model 3 ─ street-cleaning frequency
+mod3 <- betareg(abst_prop ~ avg_age + pop_esp_prop + log_pop_density + 
+                  log_net_income + high_edu_prop + log_bin_density +
+                  log_light_density + avg_clean + I(avg_clean^2) + factor(district), 
+                data = data, weights = total_pop)
+summary(mod3)
+```
+
+#### Context interactions
+
+Finally, the fourth model includes interaction terms between cleanliness and contextual characteristics such as income, population density, and streetlight density. The purpose of these interactions is to explore whether the potential effect of cleanliness on political disengagement depends on the broader socio-economic or infrastructural environment. For example, the influence of cleaning levels may vary depending on whether an area is densely populated or more affluent.
+
+```{r}
+## Model 4 ─ interactions (cleaning × context)
+mod4 <- betareg(abst_prop ~ avg_age + pop_esp_prop + log_pop_density + 
+                  log_net_income + high_edu_prop + log_bin_density +
+                  log_light_density + avg_clean + I(avg_clean^2) +
+                  avg_clean:log_net_income + avg_clean:log_light_density +
+                  avg_clean:log_pop_density + factor(district), 
+                data = data, weights = total_pop)
+summary(mod4)
+```
+
+#### Model comparison and improvements
+
+With the full set of *beta regression* models estimated, it is useful to assess whether the inclusion of new covariates (especially contextual variables and street cleanliness) actually improves the model fit. This comparison can be carried out using the Akaike Information Criterion (AIC) and log-likelihood values, which help evaluate how well each model explains the data while penalising for model complexity.
+
+A lower AIC and a higher log-likelihood indicate a better-fitting model. This step allows identifying which combination of predictors contributes most meaningfully to understanding the variation in abstention across census tracts.
+
+```{r}
+AIC(mod1, mod2, mod3, mod4)
+logLik(mod1); logLik(mod2); logLik(mod3); logLik(mod4)
+```
+
+Since model 4 offers the best fit according to the AIC and log-likelihood values, it serves as a reference for further evaluations. However, even a well-fitted model may leave spatial patterns in the residuals unaddressed. To examine whether spatial autocorrelation persists, a Moran's I test can be applied to the model residuals. If the residuals show statistically significant spatial clustering, this would justify the use of spatial regression techniques to capture remaining spatial dependencies.
+
+```{r}
+# Neighbours matrix (closest ks)
+coords <- st_coordinates(st_centroid(data)) # extract centroids from the data
+nb <- knn2nb(knearneigh(coords, k = 4))
+lw <- nb2listw(nb, style = "W")
+
+# Moran test to check possible spatial autocorrelation
+moran.test(residuals(mod4, type = "pearson"), lw)
+```
+
+The results of Moran’s I test indicate a p-value below 0.05, suggesting that the null hypothesis of no spatial autocorrelation should be rejected. This implies that the dependent variable exhibits significant spatial dependence. To address this issue, the analysis must incorporate spatial modelling techniques. The [*spatialreg* package](https://cran.r-project.org/web/packages/spatialreg/spatialreg.pdf) offers tools designed for this purpose. In particular, the *lagsarlm* function that could a spatial lag model, which extends the standard linear regression framework by explicitly accounting for spatial interdependence among observations.
+
+```{r}
+spatial_mod4 <- lagsarlm(abst_prop ~ avg_age + pop_esp_prop + log_pop_density +
+                           log_net_income + high_edu_prop + log_bin_density +
+                           log_light_density + avg_clean + I(avg_clean^2) +
+                           avg_clean:log_net_income + avg_clean:log_light_density +
+                           avg_clean:log_pop_density + factor(district),
+                         data = data, listw = lw, method = "eigen")
+
+summary(spatial_mod4)
+```
+
+The next step is to save these models in a table to be included in the report.
+
+```{r}
+# Correct names for the variables that appear in the tables
+var_labels <- c(
+  # Main regressors
+  avg_age = "Average age",
+  pop_esp_prop = "Proportion of Spanish nationals",
+  log_pop_density = "ln(Population density)",
+  log_net_income = "ln(Net income)",
+  high_edu_prop = "Higher-education proportion",
+  log_bin_density = "ln(Bin density)",
+  log_light_density = "ln(Street-light density)",
+  avg_clean = "Street cleanliness",
+  "I(avg_clean^2)" = "Cleanliness$^{2}$",
+  # Interactions
+  "avg_clean:log_net_income" = "Cleanliness × ln(Income)",
+  "avg_clean:log_light_density" = "Cleanliness × ln(Light density)",
+  "avg_clean:log_pop_density" = "Cleanliness × ln(Pop. density)")
+
+# Models selected
+abs_models <- list(mod1, mod2, mod3, mod4, spatial_mod4)
+
+# standard-error list
+se_abs <- lapply(abs_models, function(m) sqrt(diag(vcov(m))))
+
+# spatial ρ row
+rho_abs <- list(c("Spatial $\\rho$", "", "", "", "",
+                  sprintf("%.3f", spatial_mod4$rho)))
+
+# Table with stargazer
+stargazer(abs_models, out = "tables/abs_models.tex",
+          dep.var.labels.include = FALSE,
+          covariate.labels = unname(var_labels),
+          omit = "factor\\(district\\)", 
+          se = se_abs,
+          add.lines = rho_abs,
+          digits = 2,
+          float = FALSE,
+          header = FALSE,
+          align = TRUE)
+```
+
+### Winning party vote difference 2019-2023
+
+This section explores the second outcome of interest: the change in vote share for the most voted party between the 2019 and 2023 municipal elections. The same explanatory variables and interaction terms used in the previous models are maintained, as they capture relevant demographic, economic and contextual effects.
+
+#### Linear regression model
+
+First, a standard linear regression model is estimated using the vote difference as the dependent variable. The objective is to determine whether changes in local conditions such as street cleanliness, income or service density are associated with changes in political support for the leading party. The district-level fixed effects and population weights to control for structural differences are also included.
+
+```{r}
+votediff_lm <- lm(diff_vote ~ avg_age + pop_esp_prop + log_pop_density + 
+                      log_net_income + high_edu_prop + log_bin_density +
+                      log_light_density + avg_clean + I(avg_clean^2) +
+                      avg_clean:log_net_income + avg_clean:log_light_density +
+                      avg_clean:log_pop_density + factor(district),
+                    data = data, weights = total_pop)
+summary(votediff_lm)
+```
+
+#### Spatial regression model
+
+To test for potential spatial dependencies in the residuals of the linear model, a spatial regression must also be applied. This model adjusts for autocorrelation by incorporating a spatially weighted average of the dependent variable of neighbouring districts. Comparing the two models allows us to see whether spatial dynamics play a significant role in explaining electoral changes.
+
+```{r}
+votediff_spatial <- lagsarlm(diff_vote ~ avg_age + pop_esp_prop + 
+                               log_pop_density + log_net_income + high_edu_prop +
+                               log_bin_density + log_light_density + avg_clean +
+                               I(avg_clean^2) + avg_clean:log_net_income +
+                               avg_clean:log_light_density +
+                               avg_clean:log_pop_density + factor(district),
+                             data = data, listw = lw, method = "eigen")
+summary(votediff_spatial)
+```
+
+```{r}
+AIC(votediff_lm, votediff_spatial)
+```
+
+The AIC scores show that the spatial specification offers a better fit. The next step is to save these models in a table to be included in the report.
+
+```{r}
+vote_models <- list(votediff_lm, votediff_spatial)
+
+se_vote <- lapply(vote_models, function(m) sqrt(diag(vcov(m))))
+
+rho_vote <- list(c("Spatial $\\rho$", "", sprintf("%.3f", votediff_spatial$rho)))
+
+stargazer(vote_models, out = "tables/vote_models.tex",
+          dep.var.labels.include = FALSE,
+          covariate.labels = unname(var_labels),
+          omit = "factor\\(district\\)",
+          se = se_vote,
+          add.lines = rho_vote,
+          digits = 2,
+          align = TRUE,
+          float = FALSE,
+          header = FALSE)
+```
+
+## Main findings and discussion
+
+The study set out to examine whether the frequency of street-cleaning helps explain political disengagement in Madrid once standard demographic and socio-economic factors are controlled. Two outcomes were analysed: the abstention rate in the 2023 municipal election and the change in the vote share of the winning party between 2019 and 2023. The key results are as follows.
+
+First, in the case of the abstention rate, it has been shown that baseline factors are key to understanding its variation. Older populations with a higher proportion of Spaniards vote more, while more densely populated and poorer sections abstain more often. In addition, sections where streets are cleaned more often exhibit lower abstention rates. In the spatial-lag model the cleanliness index enters negatively. Moving from a rarely cleaned section (≈ 1) to one that is cleaned very frequently (≈ 4) lowers the expected abstention proportion. On the other hand, there is weak evidence of non-linearity. The squared term is not significant, so the relationship is almost linear. The spatial clustering is slight but significant. This is tested by the spatial autoregressive parameter, which is small but highly significant. Adding it reduces the AIC and removes the residual autocorrelation without altering the cleaning effect.
+
+For the second outcome (change in the vote for the winning party), it has been shown that economic resources dominate the variations. Increases in votes for the winning party in 2019 are higher in wealthier and better educated sectors. Moreover, cleanliness interacts with context. On average, more frequently cleaned sections lose more votes for the most voted party in 2019 and the interaction with income is positive: in affluent areas the *dirt penalty* largely disappears or even reverses. On the other hand, spatial dependence is highly relevant. The spatial model drastically improves the fit (the AIC is reduced), confirming that electoral changes propagate between neighbouring areas.
+
+The main conclusion obtained with this research is that poorly maintained streets appear to discourage turnout, consistent with the idea that uneven service delivery decrease civic engagement. Where cleaning frequencies remained low in less-affluent districts, turnout declined and the governing party saw limited gains. In wealthier districts, maintained cleaning coincided with larger vote increases, suggesting a reward mechanism. In addition, spatial distribution matter but do not overturn the core relationship. Accounting for neighbourhood influence improves statistical fit, but it does not affect the direction and significance of the cleanliness effect.
+
+These findings demostrate that ensuring more uniform cleaning standards could help close turnout gaps and mitigate perceptions of neglect. The findings show that basic urban maintenance is not only an aesthetic concern; it also shapes democratic participation and electoral dynamics within the city.
